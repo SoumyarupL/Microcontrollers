@@ -1,35 +1,52 @@
-/**
- *  V. Hunter Adams (vha3@cornell.edu)
- 
-    This is an experiment with the multicore capabilities on the
-    RP2040. The program instantiates a timer interrupt on each core.
-    Each of these timer interrupts writes to a separate channel
-    of the SPI DAC and does DDS of two sine waves of two different
-    frequencies. These sine waves are amplitude-modulated to "beeps."
-
-    No spinlock is required to mediate the SPI writes because of the
-    SPI buffer on the RP2040. Spinlocks are used in the main program
-    running on each core to lock the other out from an incrementing
-    global variable. These are "under the hood" of the PT_SEM_SAFE_x
-    macros. Two threads ping-pong using these semaphores.
-
-    Note that globals are visible from both cores. Note also that GPIO
-    pin mappings performed on core 0 can be utilized from core 1.
-    Creation of an alarm pool is required to force a timer interrupt to
-    take place on core 1 rather than core 0.
-
- */
-
 // Include necessary libraries
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/sync.h"
 #include "hardware/spi.h"
+// Include VGA graphics library
+#include "vga_graphics.h"
+// Include standard libraries
+
+// Include hardware libraries
+#include "hardware/uart.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/adc.h"
+#include "hardware/irq.h"
 // Include protothreads
 #include "pt_cornell_rp2040_v1.h"
+
+/////////////////////////// ADC configuration ////////////////////////////////
+// ADC Channel and pin
+#define ADC_CHAN 0
+#define ADC_PIN 26
+// Number of samples per FFT
+#define NUM_SAMPLES 1024
+// Number of samples per FFT, minus 1
+#define NUM_SAMPLES_M_1 1023
+// Length of short (16 bits) minus log2 number of samples (10)
+#define SHIFT_AMOUNT 6
+// Log2 number of samples
+#define LOG2_NUM_SAMPLES 10
+// Sample rate (Hz)
+#define Fs_adc 10000.0
+// ADC clock rate (unmutable!)
+#define ADCCLK 48000000.0
+
+// DMA channels for sampling ADC (VGA driver uses 0 and 1)
+int sample_chan = 2 ;
+int control_chan = 3 ;
+volatile int counter_0 = 0;
+volatile int counter_1 = 0;
+int cnt = 0;
+
+// Max and min macros
+#define max(a,b) ((a>b)?a:b)
+#define min(a,b) ((a<b)?a:b)
 
 // Macros for fixed-point arithmetic (faster than floating point)
 typedef signed int fix15 ;
@@ -62,6 +79,25 @@ fix15 sin_table[sine_table_size] ;
 // Values output to DAC
 int DAC_output_0 ;
 int DAC_output_1 ;
+
+
+// 0.4 in fixed point (used for alpha max plus beta min)
+fix15 zero_point_4 = float2fix15(0.4) ;
+
+// Here's where we'll have the DMA channel put ADC samples
+uint8_t sample_array[NUM_SAMPLES] ;
+// And here's where we'll copy those samples for FFT calculation
+fix15 fr[NUM_SAMPLES] ;
+fix15 fi[NUM_SAMPLES] ;
+
+// Sine table for the FFT calculation
+fix15 Sinewave[NUM_SAMPLES]; 
+// Hann window table for FFT calculation
+fix15 window[NUM_SAMPLES]; 
+
+// Pointer to address of start of sample buffer
+uint8_t * sample_address_pointer = &sample_array[0] ;
+
 
 //Boolean for button control
 volatile bool chirp_core_0 = true;
@@ -122,13 +158,104 @@ volatile int global_counter = 0 ;
 struct pt_sem core_1_go, core_0_go ;
 
 
+
+// Peforms an in-place FFT. For more information about how this
+// algorithm works, please see https://vanhunteradams.com/FFT/FFT.html
+void FFTfix(fix15 fr[], fix15 fi[]) {
+    
+    unsigned short m;   // one of the indices being swapped
+    unsigned short mr ; // the other index being swapped (r for reversed)
+    fix15 tr, ti ; // for temporary storage while swapping, and during iteration
+    
+    int i, j ; // indices being combined in Danielson-Lanczos part of the algorithm
+    int L ;    // length of the FFT's being combined
+    int k ;    // used for looking up trig values from sine table
+    
+    int istep ; // length of the FFT which results from combining two FFT's
+    
+    fix15 wr, wi ; // trigonometric values from lookup table
+    fix15 qr, qi ; // temporary variables used during DL part of the algorithm
+    
+    //////////////////////////////////////////////////////////////////////////
+    ////////////////////////// BIT REVERSAL //////////////////////////////////
+    //////////////////////////////////////////////////////////////////////////
+    // Bit reversal code below based on that found here: 
+    // https://graphics.stanford.edu/~seander/bithacks.html#BitReverseObvious
+    for (m=1; m<NUM_SAMPLES_M_1; m++) {
+        // swap odd and even bits
+        mr = ((m >> 1) & 0x5555) | ((m & 0x5555) << 1);
+        // swap consecutive pairs
+        mr = ((mr >> 2) & 0x3333) | ((mr & 0x3333) << 2);
+        // swap nibbles ... 
+        mr = ((mr >> 4) & 0x0F0F) | ((mr & 0x0F0F) << 4);
+        // swap bytes
+        mr = ((mr >> 8) & 0x00FF) | ((mr & 0x00FF) << 8);
+        // shift down mr
+        mr >>= SHIFT_AMOUNT ;
+        // don't swap that which has already been swapped
+        if (mr<=m) continue ;
+        // swap the bit-reveresed indices
+        tr = fr[m] ;
+        fr[m] = fr[mr] ;
+        fr[mr] = tr ;
+        ti = fi[m] ;
+        fi[m] = fi[mr] ;
+        fi[mr] = ti ;
+    }
+    //////////////////////////////////////////////////////////////////////////
+    ////////////////////////// Danielson-Lanczos //////////////////////////////
+    //////////////////////////////////////////////////////////////////////////
+    // Adapted from code by:
+    // Tom Roberts 11/8/89 and Malcolm Slaney 12/15/94 malcolm@interval.com
+    // Length of the FFT's being combined (starts at 1)
+    L = 1 ;
+    // Log2 of number of samples, minus 1
+    k = LOG2_NUM_SAMPLES - 1 ;
+    // While the length of the FFT's being combined is less than the number 
+    // of gathered samples . . .
+    while (L < NUM_SAMPLES) {
+        // Determine the length of the FFT which will result from combining two FFT's
+        istep = L<<1 ;
+        // For each element in the FFT's that are being combined . . .
+        for (m=0; m<L; ++m) { 
+            // Lookup the trig values for that element
+            j = m << k ;                         // index of the sine table
+            wr =  Sinewave[j + NUM_SAMPLES/4] ; // cos(2pi m/N)
+            wi = -Sinewave[j] ;                 // sin(2pi m/N)
+            wr >>= 1 ;                          // divide by two
+            wi >>= 1 ;                          // divide by two
+            // i gets the index of one of the FFT elements being combined
+            for (i=m; i<NUM_SAMPLES; i+=istep) {
+                // j gets the index of the FFT element being combined with i
+                j = i + L ;
+                // compute the trig terms (bottom half of the above matrix)
+                tr = multfix15(wr, fr[j]) - multfix15(wi, fi[j]) ;
+                ti = multfix15(wr, fi[j]) + multfix15(wi, fr[j]) ;
+                // divide ith index elements by two (top half of above matrix)
+                qr = fr[i]>>1 ;
+                qi = fi[i]>>1 ;
+                // compute the new values at each index
+                fr[j] = qr - tr ;
+                fi[j] = qi - ti ;
+                fr[i] = qr + tr ;
+                fi[i] = qi + ti ;
+            }    
+        }
+        --k ;
+        L = istep ;
+    }
+}
+
 // This timer ISR is called on core 1
 bool repeating_timer_callback_core_1(struct repeating_timer *t) {
     if (!gpio_get(BUTTON_1)){
-         count_1=0;
+        count_1=0;
+        STATE_1 = 2;
+        chirp_core_1 = false;
         }
     else{
     if (STATE_1 == 0) {
+        chirp_core_1 = true;
         // DDS phase and sine table lookup
         phase_accum_main_1 += phase_incr_main_1  ;
         DAC_output_1 = fix2int15(multfix15(current_amplitude_1,
@@ -151,7 +278,6 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
 
         // Increment the counter
         count_1 += 1 ;
-
         
         if (count_1 == SYLL_LENGTH) {
             syll_count_1 +=1;
@@ -172,6 +298,7 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
 
     
     else if (STATE_1 == 1){
+        //chirp_core_1 = false;
         count_1 += 1 ;
         // State transition: Transition from Syllable Pause to Chirp
         if (count_1 == SYLL_REPEAT_INTERVAL) {
@@ -183,6 +310,7 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
     }
 
     else{
+        //chirp_core_1 = false;
         count_1 += 1 ;
         // State transition: Transition from Chirp Pause to Chirp
         if (count_1 == CHIRP_REPEAT_INTERVAL) {
@@ -205,10 +333,13 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
 bool repeating_timer_callback_core_0(struct repeating_timer *t) {
     if (!gpio_get(BUTTON_0)){
         count_0 = 0;
+        chirp_core_0 = false;
+        STATE_0 = 2;
         //printf("Button_0 pressed");
         }
     else{
     if (STATE_0 == 0) {
+        chirp_core_0 = true;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0  ;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -252,6 +383,7 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
 
     // State transition?
     else if (STATE_0 == 1){
+        //chirp_core_0 = false;
         count_0 += 1 ;
         // State transition: Transition from Syllable Pause to Chirp
         if (count_0 == SYLL_REPEAT_INTERVAL) {
@@ -263,6 +395,7 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
     }
 
     else{
+        //chirp_core_0 = false;
         count_0 += 1 ;
         // State transition: Transition from Chirp Pause to Chirp
         if (count_0 == CHIRP_REPEAT_INTERVAL) {
@@ -281,6 +414,127 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
     return true;
 }
 
+// This thread runs on core 0
+static PT_THREAD (protothread_fft_0(struct pt *pt))
+{
+    // Indicate beginning of thread
+    PT_BEGIN(pt) ;
+    
+    // Start the ADC channel
+    dma_start_channel_mask((1u << sample_chan)) ;
+    // Start the ADC
+    adc_run(true) ;
+
+    // Declare some static variables
+    static int height ;             // for scaling display
+    static float max_freqency ;     // holds max frequency
+    static int i ;                  // incrementing loop variable
+
+    static fix15 max_fr ;           // temporary variable for max freq calculation
+    static int max_fr_dex ;         // index of max frequency
+
+    // Write some text to VGA
+    setTextColor(WHITE) ;
+    setCursor(65, 0) ;
+    setTextSize(1) ;
+    writeString("Raspberry Pi Pico") ;
+    setCursor(65, 10) ;
+    writeString("Class:") ;
+    setCursor(65, 20) ;
+    writeString("Microcontrollers Lab1") ;
+    setCursor(65, 30) ;
+    writeString("Cricket Chirp Detection") ;
+    setCursor(250, 0) ;
+    setTextSize(2) ;
+    writeString("Max freqency:") ;
+
+    // Will be used to write dynamic text to screen
+    static char freqtext[40];
+
+
+    while(1) {
+        // Wait for NUM_SAMPLES samples to be gathered
+        // Measure wait time with timer. THIS IS BLOCKING
+        dma_channel_wait_for_finish_blocking(sample_chan);
+
+        //printf("Starting capture on core_0\n") ;
+
+        // Copy/window elements into a fixed-point array
+        for (i=0; i<NUM_SAMPLES; i++) {
+            fr[i] = multfix15(int2fix15((int)sample_array[i]), window[i]) ;
+            fi[i] = (fix15) 0 ;
+        }
+
+        // Zero max frequency and max frequency index
+        max_fr = 0 ;
+        max_fr_dex = 0 ;
+
+        // Restart the sample channel, now that we have our copy of the samples
+        dma_channel_start(control_chan) ;
+
+        // Compute the FFT
+        FFTfix(fr, fi) ;
+
+        // Find the magnitudes (alpha max plus beta min)
+        for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
+            // get the approx magnitude
+            fr[i] = abs(fr[i]); 
+            fi[i] = abs(fi[i]);
+            // reuse fr to hold magnitude
+            fr[i] = max(fr[i], fi[i]) + 
+                    multfix15(min(fr[i], fi[i]), zero_point_4); 
+
+            // Keep track of maximum
+            if (fr[i] > max_fr && i>4) {
+                max_fr = fr[i] ;
+                max_fr_dex = i ;
+            }
+        }
+        // Compute max frequency in Hz
+        max_freqency = max_fr_dex * (Fs_adc/NUM_SAMPLES) ;
+        //printf("STATE_0: %d, STATE_1: %d\n", STATE_0, STATE_1);
+        //printf("Max: %f\n",max_freqency);
+         if (abs(max_freqency - 2300.0)<100){
+                cnt += 1;
+                if (cnt ==1){
+                    if (STATE_0 == 0 && STATE_1 == 0){
+                        printf("Both\n");
+                    }
+                    else if (STATE_0 == 0 && (STATE_1 == 1 || STATE_1 == 2)){
+                        printf("Chirp detected Core 0\n");
+                    }
+                    else if (STATE_1 == 0 && (STATE_0 == 1 || STATE_0 == 2))
+                    {
+                        printf("Chirp detected Core 1\n");
+                    }
+
+                    if (chirp_core_0 == 0  && chirp_core_1 == 0){
+                        printf("Chirp From Elsewhere\n");
+                    }
+                    //PT_YIELD_usec(260000) ;
+                    cnt = 0;
+                }
+            }
+
+
+        // Display on VGA
+        fillRect(250, 20, 176, 30, BLACK); // red box
+        sprintf(freqtext, "%d", (int)max_freqency) ;
+        setCursor(250, 20) ;
+        setTextSize(2) ;
+        writeString(freqtext) ;
+
+        // Update the FFT display
+        for (int i=5; i<(NUM_SAMPLES>>1); i++) {
+            drawVLine(59+i, 50, 429, BLACK);
+            height = fix2int15(multfix15(fr[i], int2fix15(36))) ;
+            drawVLine(59+i, 479-height, height, WHITE);
+        }
+
+    }
+    PT_END(pt) ;
+}
+
 // This thread runs on core 1
 static PT_THREAD (protothread_core_1(struct pt *pt))
 {
@@ -292,7 +546,6 @@ static PT_THREAD (protothread_core_1(struct pt *pt))
         // Turn off LED
         gpio_put(LED, 0) ;
         // Increment global counter variable
-        
         for (int i=0; i<10; i++) {
             global_counter += 1 ;
             sleep_ms(250) ;
@@ -306,31 +559,93 @@ static PT_THREAD (protothread_core_1(struct pt *pt))
     PT_END(pt) ;
 }
 
-// This thread runs on core 0
-static PT_THREAD (protothread_core_0(struct pt *pt))
+static PT_THREAD (protothread_fft_1(struct pt *pt))
 {
-    // Indicate thread beginning
+    // Indicate beginning of thread
     PT_BEGIN(pt) ;
+    printf("Starting capture\n") ;
+    // Start the ADC channel
+    dma_start_channel_mask((1u << sample_chan)) ;
+    // Start the ADC
+    adc_run(true) ;
+
+    // Declare some static variables
+    static int height ;             // for scaling display
+    static float max_freqency ;     // holds max frequency
+    static int i ;                  // incrementing loop variable
+
+    static fix15 max_fr ;           // temporary variable for max freq calculation
+    static int max_fr_dex ;         // index of max frequency
+
+
+    // Will be used to write dynamic text to screen
+    //static char freqtext[40];
+
+
     while(1) {
-        // Wait for signal
-        PT_SEM_SAFE_WAIT(pt, &core_0_go) ;
-        // Turn on LED
-        gpio_put(LED, 1) ;
-        
-        // Increment global counter variable
-        for (int i=0; i<10; i++) {
-            global_counter += 1 ;
-            sleep_ms(250) ;
-            printf("Core 0: %d, ISR core: %d\n", global_counter, corenum_0) ;
+        // Wait for NUM_SAMPLES samples to be gathered
+        // Measure wait time with timer. THIS IS BLOCKING
+        dma_channel_wait_for_finish_blocking(sample_chan);
+
+        // Copy/window elements into a fixed-point array
+        for (i=0; i<NUM_SAMPLES; i++) {
+            fr[i] = multfix15(int2fix15((int)sample_array[i]), window[i]) ;
+            fi[i] = (fix15) 0 ;
         }
-        printf("\n\n") ;
-        // signal other core
-        PT_SEM_SAFE_SIGNAL(pt, &core_1_go) ;
+
+        // Zero max frequency and max frequency index
+        max_fr = 0 ;
+        max_fr_dex = 0 ;
+
+        // Restart the sample channel, now that we have our copy of the samples
+        dma_channel_start(control_chan) ;
+
+        // Compute the FFT
+        FFTfix(fr, fi) ;
+
+        // Find the magnitudes (alpha max plus beta min)
+        for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
+            // get the approx magnitude
+            fr[i] = abs(fr[i]); 
+            fi[i] = abs(fi[i]);
+            // reuse fr to hold magnitude
+            fr[i] = max(fr[i], fi[i]) + 
+                    multfix15(min(fr[i], fi[i]), zero_point_4); 
+
+            // Keep track of maximum
+            if (fr[i] > max_fr && i>4) {
+                max_fr = fr[i] ;
+                max_fr_dex = i ;
+            }
+        }
+        // Compute max frequency in Hz
+        max_freqency = max_fr_dex * (Fs_adc/NUM_SAMPLES) ;
+        //printf("Chirp_core_0: %d\n", chirp_core_0);
+        if(chirp_core_0){
+            if (abs(max_freqency - 2300.0)<100 && STATE_1 !=0){
+                printf("Chirp detected Core 1: %f\n",max_freqency);
+                PT_YIELD_usec(260000) ;
+            }
+        }
+
+        /*// Display on VGA
+        fillRect(250, 20, 176, 30, BLACK); // red box
+        sprintf(freqtext, "%d", (int)max_freqency) ;
+        setCursor(250, 20) ;
+        setTextSize(2) ;
+        writeString(freqtext) ;
+       
+
+        // Update the FFT display
+        for (int i=5; i<(NUM_SAMPLES>>1); i++) {
+            drawVLine(59+i, 50, 429, BLACK);
+            height = fix2int15(multfix15(fr[i], int2fix15(36))) ;
+            drawVLine(59+i, 479-height, height, WHITE);
+        }*/
+
     }
-    // Indicate thread end
     PT_END(pt) ;
 }
-
 
 // This is the core 1 entry point. Essentially main() for core 1
 void core1_entry() {
@@ -351,6 +666,7 @@ void core1_entry() {
 
     // Add thread to core 1
     pt_add_thread(protothread_core_1) ;
+    //pt_add_thread(protothread_fft_1) ;
 
     // Start scheduler on core 1
     pt_schedule_start ;
@@ -394,6 +710,88 @@ int main() {
     gpio_set_dir(BUTTON_1, GPIO_IN);
     gpio_pull_up(BUTTON_1);
 
+    // Initialize the VGA screen
+    initVGA() ;
+
+    ///////////////////////////////////////////////////////////////////////////////
+    // ============================== ADC CONFIGURATION ==========================
+    //////////////////////////////////////////////////////////////////////////////
+    // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
+    adc_gpio_init(ADC_PIN);
+
+    // Initialize the ADC harware
+    // (resets it, enables the clock, spins until the hardware is ready)
+    adc_init() ;
+
+    // Select analog mux input (0...3 are GPIO 26, 27, 28, 29; 4 is temp sensor)
+    adc_select_input(ADC_CHAN) ;
+
+    // Setup the FIFO
+    adc_fifo_setup(
+        true,    // Write each completed conversion to the sample FIFO
+        true,    // Enable DMA data request (DREQ)
+        1,       // DREQ (and IRQ) asserted when at least 1 sample present
+        false,   // We won't see the ERR bit because of 8 bit reads; disable.
+        true     // Shift each sample to 8 bits when pushing to FIFO
+    );
+
+    // Divisor of 0 -> full speed. Free-running capture with the divider is
+    // equivalent to pressing the ADC_CS_START_ONCE button once per `div + 1`
+    // cycles (div not necessarily an integer). Each conversion takes 96
+    // cycles, so in general you want a divider of 0 (hold down the button
+    // continuously) or > 95 (take samples less frequently than 96 cycle
+    // intervals). This is all timed by the 48 MHz ADC clock. This is setup
+    // to grab a sample at 10kHz (48Mhz/10kHz - 1)
+    adc_set_clkdiv(ADCCLK/Fs_adc);
+
+
+    // Populate the sine table and Hann window table
+    int ij;
+    for (ij = 0; ij < NUM_SAMPLES; ij++) {
+        Sinewave[ij] = float2fix15(sin(6.283 * ((float) ij) / (float)NUM_SAMPLES));
+        window[ij] = float2fix15(0.5 * (1.0 - cos(6.283 * ((float) ij) / ((float)NUM_SAMPLES))));
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////
+    // ============================== ADC DMA CONFIGURATION =========================
+    /////////////////////////////////////////////////////////////////////////////////
+
+    // Channel configurations
+    dma_channel_config c2 = dma_channel_get_default_config(sample_chan);
+    dma_channel_config c3 = dma_channel_get_default_config(control_chan);
+
+
+    // ADC SAMPLE CHANNEL
+    // Reading from constant address, writing to incrementing byte addresses
+    channel_config_set_transfer_data_size(&c2, DMA_SIZE_8);
+    channel_config_set_read_increment(&c2, false);
+    channel_config_set_write_increment(&c2, true);
+    // Pace transfers based on availability of ADC samples
+    channel_config_set_dreq(&c2, DREQ_ADC);
+    // Configure the channel
+    dma_channel_configure(sample_chan,
+        &c2,            // channel config
+        sample_array,   // dst
+        &adc_hw->fifo,  // src
+        NUM_SAMPLES,    // transfer count
+        false            // don't start immediately
+    );
+
+    // CONTROL CHANNEL
+    channel_config_set_transfer_data_size(&c3, DMA_SIZE_32);      // 32-bit txfers
+    channel_config_set_read_increment(&c3, false);                // no read incrementing
+    channel_config_set_write_increment(&c3, false);               // no write incrementing
+    channel_config_set_chain_to(&c3, sample_chan);                // chain to sample chan
+
+    dma_channel_configure(
+        control_chan,                         // Channel to be configured
+        &c3,                                // The configuration we just created
+        &dma_hw->ch[sample_chan].write_addr,  // Write address (channel 0 read address)
+        &sample_address_pointer,                   // Read address (POINTER TO AN ADDRESS)
+        1,                                  // Number of transfers, in this case each is 4 byte
+        false                               // Don't start immediately.
+    );
+
 
     // set up increments for calculating bow envelope
     attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME)) ;
@@ -420,14 +818,13 @@ int main() {
     // repeating_timer_callback (defaults core 0)
     struct repeating_timer timer_core_0;
 
-    
-    
-        // Negative delay so means we will call repeating_timer_callback, and call it
-        // again 25us (40kHz) later regardless of how long the callback took to execute
+    // Negative delay so means we will call repeating_timer_callback, and call it
+    // again 25us (40kHz) later regardless of how long the callback took to execute
     add_repeating_timer_us(-25, 
     repeating_timer_callback_core_0, NULL, &timer_core_0);
     // Add core 0 threads
-    pt_add_thread(protothread_core_0) ;
+    //pt_add_thread(protothread_core_0) ;
+    pt_add_thread(protothread_fft_0) ;
 
     // Start scheduling core 0 threads
     pt_schedule_start ;

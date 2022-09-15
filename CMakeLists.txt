@@ -1,31 +1,18 @@
-cmake_minimum_required(VERSION 3.12)
+add_executable(multitest_incremental multitest.c)
 
-# Pull in SDK (must be before project)
-include(pico_sdk_import.cmake)
+# must match with pio filename and executable name from above
+pico_generate_pio_header(multitest_incremental ${CMAKE_CURRENT_LIST_DIR}/hsync.pio)
+pico_generate_pio_header(multitest_incremental ${CMAKE_CURRENT_LIST_DIR}/vsync.pio)
+pico_generate_pio_header(multitest_incremental ${CMAKE_CURRENT_LIST_DIR}/rgb.pio)
 
-project(pico_examples C CXX ASM)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+# must match with executable name and source file names
+target_sources(multitest_incremental PRIVATE multitest.c vga_graphics.c)
 
-if (PICO_SDK_VERSION_STRING VERSION_LESS "1.3.0")
-    message(FATAL_ERROR "Raspberry Pi Pico SDK version 1.3.0 (or later) required. Your version is ${PICO_SDK_VERSION_STRING}")
-endif()
+# Add pico_multicore which is required for multicore functionality
+target_link_libraries(multitest_incremental PRIVATE pico_stdlib pico_multicore pico_bootsel_via_double_reset hardware_sync hardware_spi hardware_pio hardware_dma hardware_adc hardware_irq hardware_uart)
 
-set(PICO_EXAMPLES_PATH ${PROJECT_SOURCE_DIR})
+pico_enable_stdio_usb(multitest_incremental 1)
+pico_enable_stdio_uart(multitest_incremental 0)
 
-# Initialize the SDK
-pico_sdk_init(Button_test)
-
-include(example_auto_set_url.cmake)
-# Add blink example
-add_subdirectory(Lab1)
-add_subdirectory(Button_test)
-add_subdirectory(FFT)
-
-
-add_compile_options(-Wall
-        -Wno-format          # int != int32_t as far as the compiler is concerned because gcc has int32_t as long int
-        -Wno-unused-function # we have some for the docs that aren't called
-        -Wno-maybe-uninitialized
-        )
-
+# create map/bin/hex file etc.
+pico_add_extra_outputs(multitest_incremental)

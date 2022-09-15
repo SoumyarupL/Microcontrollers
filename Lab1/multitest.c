@@ -59,6 +59,8 @@ typedef signed int fix15 ;
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
 #define divfix(a,b) (fix15)( (((signed long long)(a)) << 15) / (b))
 
+#define epsilon 5
+
 //Direct Digital Synthesis (DDS) parameters
 #define two32 4294967296.0  // 2^32 (a constant)
 #define Fs 40000            // sample rate
@@ -98,6 +100,8 @@ fix15 window[NUM_SAMPLES];
 // Pointer to address of start of sample buffer
 uint8_t * sample_address_pointer = &sample_array[0] ;
 
+volatile bool chirp_0_detected = false;
+volatile bool chirp_1_detected = false;
 
 //Boolean for button control
 volatile bool chirp_core_0 = true;
@@ -116,13 +120,21 @@ fix15 current_amplitude_1 = 0 ;         // current amplitude (modified in ISR)
 #define SUSTAIN_TIME            10000
 #define SYLL_LENGTH             680
 #define SYLL_REPEAT_INTERVAL    80
-#define CHIRP_REPEAT_INTERVAL   10400
+#define CHIRP_REPEAT_INTERVAL   40000
 
 // State machine variables
 volatile unsigned int STATE_0 = 0 ;
 volatile unsigned int count_0 = 0 ;
+volatile float count_0_y_old = 0.0;
+volatile float count_0_y_new = 0.0;
+volatile float integral_0 = 0.0;
 volatile unsigned int STATE_1 = 0 ;
 volatile unsigned int count_1 = 0 ;
+volatile float count_1_y_old = 0.0;
+volatile float count_1_y_new = 0.0;
+volatile float integral_1 = 0.0;
+
+
 volatile unsigned int syll_count_0 = 0 ;
 volatile unsigned int syll_count_1 = 0 ;
 
@@ -153,6 +165,10 @@ volatile int corenum_1  ;
 
 // Global counter for spinlock experimenting
 volatile int global_counter = 0 ;
+
+int spinlock_num_count ;
+spin_lock_t *spinlock_count_0 ;
+spin_lock_t *spinlock_count_1 ;
 
 // Semaphore
 struct pt_sem core_1_go, core_0_go ;
@@ -250,17 +266,16 @@ void FFTfix(fix15 fr[], fix15 fi[]) {
 bool repeating_timer_callback_core_1(struct repeating_timer *t) {
     if (!gpio_get(BUTTON_1)){
         count_1=0;
-        STATE_1 = 2;
-        chirp_core_1 = false;
+        STATE_1 = 0;
+        syll_count_1 = 0;
         }
     else{
     if (STATE_1 == 0) {
-        chirp_core_1 = true;
         // DDS phase and sine table lookup
         phase_accum_main_1 += phase_incr_main_1  ;
         DAC_output_1 = fix2int15(multfix15(current_amplitude_1,
             sin_table[phase_accum_main_1>>24])) + 2048 ;
-
+        
         // Ramp up amplitude
         if (count_1 < ATTACK_TIME) {
             current_amplitude_1 = (current_amplitude_1 + attack_inc) ;
@@ -279,6 +294,8 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
         // Increment the counter
         count_1 += 1 ;
         
+        count_1_y_old = count_1_y_new;
+
         if (count_1 == SYLL_LENGTH) {
             syll_count_1 +=1;
             // State transition: Transition from Chirp to Syllable Pause
@@ -313,7 +330,7 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
         //chirp_core_1 = false;
         count_1 += 1 ;
         // State transition: Transition from Chirp Pause to Chirp
-        if (count_1 == CHIRP_REPEAT_INTERVAL) {
+        if (count_1 >= CHIRP_REPEAT_INTERVAL) {
             current_amplitude_1 = 0 ;
             STATE_1 = 0 ;
             count_1 = 0 ;
@@ -333,13 +350,12 @@ bool repeating_timer_callback_core_1(struct repeating_timer *t) {
 bool repeating_timer_callback_core_0(struct repeating_timer *t) {
     if (!gpio_get(BUTTON_0)){
         count_0 = 0;
-        chirp_core_0 = false;
-        STATE_0 = 2;
+        STATE_0 = 0;
+        syll_count_0 = 0;
         //printf("Button_0 pressed");
         }
     else{
     if (STATE_0 == 0) {
-        chirp_core_0 = true;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0  ;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -362,7 +378,10 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
 
         // Increment the counter
         count_0 += 1 ;
-
+    
+        count_0_y_old = count_0_y_new;
+        
+    
         // State transition?
         if (count_0 == SYLL_LENGTH) {
             syll_count_0 +=1;
@@ -398,7 +417,7 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
         //chirp_core_0 = false;
         count_0 += 1 ;
         // State transition: Transition from Chirp Pause to Chirp
-        if (count_0 == CHIRP_REPEAT_INTERVAL) {
+        if (count_0 >= CHIRP_REPEAT_INTERVAL) {
             current_amplitude_0 = 0 ;
             STATE_0 = 0 ;
             count_0 = 0 ;
@@ -453,11 +472,31 @@ static PT_THREAD (protothread_fft_0(struct pt *pt))
 
 
     while(1) {
+
         // Wait for NUM_SAMPLES samples to be gathered
         // Measure wait time with timer. THIS IS BLOCKING
         dma_channel_wait_for_finish_blocking(sample_chan);
 
         //printf("Starting capture on core_0\n") ;
+        //printf("STATE_0 : %d, STATE_1: %d, count_0 :%d, count_1 : %d before capture\n", STATE_0,STATE_1,count_0,count_1);
+        if (STATE_0 == 0 || STATE_0 == 1){
+            chirp_core_0 = true;
+        }
+        else if(STATE_0 == 2 && count_0 > (CHIRP_REPEAT_INTERVAL - 700)){
+            chirp_core_0 = true;
+        }
+        else if (STATE_0 == 2 && (count_0 == 0 )){
+            chirp_core_0 = false;
+        }
+        if (STATE_1 == 0 || STATE_1 == 1){
+            chirp_core_1 = true;
+        }
+        else if (STATE_1 == 2 && count_1 > (CHIRP_REPEAT_INTERVAL -700)){
+            chirp_core_1 = true;
+        }
+        else if (STATE_1 == 2 && (count_1 == 0)){
+            chirp_core_1 = false;
+        }
 
         // Copy/window elements into a fixed-point array
         for (i=0; i<NUM_SAMPLES; i++) {
@@ -494,26 +533,48 @@ static PT_THREAD (protothread_fft_0(struct pt *pt))
         max_freqency = max_fr_dex * (Fs_adc/NUM_SAMPLES) ;
         //printf("STATE_0: %d, STATE_1: %d\n", STATE_0, STATE_1);
         //printf("Max: %f\n",max_freqency);
+        //printf("STATE_0 : %d, STATE_1: %d, count_0 :%d, count_1 : %d after capture\n", STATE_0,STATE_1,count_0,count_1);
          if (abs(max_freqency - 2300.0)<100){
                 cnt += 1;
-                if (cnt ==1){
-                    if (STATE_0 == 0 && STATE_1 == 0){
-                        printf("Both\n");
-                    }
-                    else if (STATE_0 == 0 && (STATE_1 == 1 || STATE_1 == 2)){
+                if (cnt == 2){
+                    if (chirp_core_0){
                         printf("Chirp detected Core 0\n");
+                        if (STATE_1 == 2){
+                            spin_lock_unsafe_blocking(spinlock_count_1) ;
+                            count_1 = (sqrt(count_1) + epsilon)*(sqrt(count_1) + epsilon);
+                            //printf("%f\n",count_1);
+                            if (count_1 > 5000){
+                                
+                                count_1 = 0;
+                                STATE_1 = 2;
+
+                            }
+                            spin_unlock_unsafe(spinlock_count_1) ;
                     }
-                    else if (STATE_1 == 0 && (STATE_0 == 1 || STATE_0 == 2))
+                    }
+                    if (chirp_core_1)
                     {
                         printf("Chirp detected Core 1\n");
+                        if (STATE_0 == 2){
+                            spin_lock_unsafe_blocking(spinlock_count_0) ;
+                            count_0 = (sqrt(count_0) + epsilon)*(sqrt(count_0) + epsilon);
+                            if (count_0 > 5000){
+                                count_0 = 0;
+                                STATE_0 = 2;
+                            }
+                            spin_unlock_unsafe(spinlock_count_0) ;
                     }
-
+                    }
                     if (chirp_core_0 == 0  && chirp_core_1 == 0){
                         printf("Chirp From Elsewhere\n");
                     }
                     //PT_YIELD_usec(260000) ;
                     cnt = 0;
                 }
+            }
+            else{
+                chirp_0_detected = false;
+                chirp_1_detected = false;
             }
 
 
@@ -559,93 +620,6 @@ static PT_THREAD (protothread_core_1(struct pt *pt))
     PT_END(pt) ;
 }
 
-static PT_THREAD (protothread_fft_1(struct pt *pt))
-{
-    // Indicate beginning of thread
-    PT_BEGIN(pt) ;
-    printf("Starting capture\n") ;
-    // Start the ADC channel
-    dma_start_channel_mask((1u << sample_chan)) ;
-    // Start the ADC
-    adc_run(true) ;
-
-    // Declare some static variables
-    static int height ;             // for scaling display
-    static float max_freqency ;     // holds max frequency
-    static int i ;                  // incrementing loop variable
-
-    static fix15 max_fr ;           // temporary variable for max freq calculation
-    static int max_fr_dex ;         // index of max frequency
-
-
-    // Will be used to write dynamic text to screen
-    //static char freqtext[40];
-
-
-    while(1) {
-        // Wait for NUM_SAMPLES samples to be gathered
-        // Measure wait time with timer. THIS IS BLOCKING
-        dma_channel_wait_for_finish_blocking(sample_chan);
-
-        // Copy/window elements into a fixed-point array
-        for (i=0; i<NUM_SAMPLES; i++) {
-            fr[i] = multfix15(int2fix15((int)sample_array[i]), window[i]) ;
-            fi[i] = (fix15) 0 ;
-        }
-
-        // Zero max frequency and max frequency index
-        max_fr = 0 ;
-        max_fr_dex = 0 ;
-
-        // Restart the sample channel, now that we have our copy of the samples
-        dma_channel_start(control_chan) ;
-
-        // Compute the FFT
-        FFTfix(fr, fi) ;
-
-        // Find the magnitudes (alpha max plus beta min)
-        for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
-            // get the approx magnitude
-            fr[i] = abs(fr[i]); 
-            fi[i] = abs(fi[i]);
-            // reuse fr to hold magnitude
-            fr[i] = max(fr[i], fi[i]) + 
-                    multfix15(min(fr[i], fi[i]), zero_point_4); 
-
-            // Keep track of maximum
-            if (fr[i] > max_fr && i>4) {
-                max_fr = fr[i] ;
-                max_fr_dex = i ;
-            }
-        }
-        // Compute max frequency in Hz
-        max_freqency = max_fr_dex * (Fs_adc/NUM_SAMPLES) ;
-        //printf("Chirp_core_0: %d\n", chirp_core_0);
-        if(chirp_core_0){
-            if (abs(max_freqency - 2300.0)<100 && STATE_1 !=0){
-                printf("Chirp detected Core 1: %f\n",max_freqency);
-                PT_YIELD_usec(260000) ;
-            }
-        }
-
-        /*// Display on VGA
-        fillRect(250, 20, 176, 30, BLACK); // red box
-        sprintf(freqtext, "%d", (int)max_freqency) ;
-        setCursor(250, 20) ;
-        setTextSize(2) ;
-        writeString(freqtext) ;
-       
-
-        // Update the FFT display
-        for (int i=5; i<(NUM_SAMPLES>>1); i++) {
-            drawVLine(59+i, 50, 429, BLACK);
-            height = fix2int15(multfix15(fr[i], int2fix15(36))) ;
-            drawVLine(59+i, 479-height, height, WHITE);
-        }*/
-
-    }
-    PT_END(pt) ;
-}
 
 // This is the core 1 entry point. Essentially main() for core 1
 void core1_entry() {
@@ -653,6 +627,9 @@ void core1_entry() {
     // create an alarm pool on core 1
     alarm_pool_t *core1pool ;
     core1pool = alarm_pool_create(2, 16) ;
+    
+    spinlock_num_count = spin_lock_claim_unused(true) ;
+    spinlock_count_1 = spin_lock_init(spinlock_num_count) ;
 
     // Create a repeating timer that calls repeating_timer_callback.
     struct repeating_timer timer_core_1;
@@ -803,6 +780,9 @@ int main() {
     for (ii = 0; ii < sine_table_size; ii++){
          sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
     }
+    
+    spinlock_num_count = spin_lock_claim_unused(true) ;
+    spinlock_count_0 = spin_lock_init(spinlock_num_count) ;
 
     // Initialize the intercore semaphores
     PT_SEM_SAFE_INIT(&core_0_go, 1) ;
